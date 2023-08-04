@@ -1,0 +1,176 @@
+package.path = './app/controllers/?.lua;' .. package.path
+
+-- dep
+local json = require 'cjson'
+
+-- gin
+local Gin = require 'gin.core.gin'
+local Controller = require 'gin.core.controller'
+local Request = require 'gin.core.request'
+local Response = require 'gin.core.response'
+local Error = require 'gin.core.error'
+
+-- app
+local Routes = require 'config.routes'
+local Application = require 'config.application'
+
+-- perf
+local error = error
+local jencode = json.encode
+local pairs = pairs
+local pcall = pcall
+local require = require
+local setmetatable = setmetatable
+local smatch = string.match
+local function tappend(t, v) t[#t + 1] = v end
+
+
+-- init Router and set routes
+local Router = {}
+
+-- response version header
+-- local response_version_header = 'gin/' .. Gin.version
+
+-- accept header for application
+-- local accept_header_matcher = "^application/vnd." .. Application.name .. ".v(%d+)(.*)+json$"
+
+
+local function create_request(ngx)
+    local ok, request_or_error = pcall(function() return Request.new(ngx) end)
+    if ok == false then
+        -- parsing errors
+        local err = Error.new(request_or_error.code, request_or_error.custom_attrs)
+        local response = Response.new({ status = err.status, body = err.body })
+        Router.respond(ngx, response)
+        return false
+    end
+    return request_or_error
+end
+
+-- main handler function, called from nginx
+function Router.handler(ngx)
+    -- add headers
+    ngx.header.content_type = 'application/json'
+    -- ngx.header["X-Framework"] = response_version_header;
+
+    -- create request object
+    local request = create_request(ngx)
+    if request == false then return end
+
+    -- get routes
+    local ok, controller_name_or_error, action, params, request = pcall(function() return Router.match(request) end)
+
+    local response
+
+    if ok == false then
+        -- match returned an error (for instance a 412 for no header match)
+        local err = Error.new(controller_name_or_error.code, controller_name_or_error.custom_attrs)
+        response = Response.new({ status = err.status, body = err.body })
+        Router.respond(ngx, response)
+    elseif controller_name_or_error then
+        -- matching routes found
+        response = Router.call_controller(request, controller_name_or_error, action, params)
+        Router.respond(ngx, response)
+    else
+        -- no matching routes found
+        ngx.exit(ngx.HTTP_NOT_FOUND)
+    end
+end
+
+-- match request to routes
+function Router.match(request)
+    local uri = request.uri
+    local method = request.method
+
+    -- match version based on headers
+    if request.headers['accept'] == nil then error({ code = 100 }) end
+
+    -- local major_version, rest_version = smatch(request.headers['accept'], accept_header_matcher)
+    local major_version, rest_version = 1, ''
+    if major_version == nil then error({ code = 101 }) end
+
+    local routes_dispatchers = Routes.dispatchers[tonumber(major_version)]
+    if routes_dispatchers == nil then error({ code = 102 }) end
+
+    -- loop dispatchers to find route
+    for i = 1, #routes_dispatchers do
+        local dispatcher = routes_dispatchers[i]
+        if dispatcher[method] then -- avoid matching if method is not defined in dispatcher
+            local match = { smatch(uri, dispatcher.pattern) }
+
+            if #match > 0 then
+                local params = {}
+                for j = 1, #match do
+                    if dispatcher[method].params[j] then
+                        params[dispatcher[method].params[j]] = match[j]
+                    else
+                        tappend(params, match[j])
+                    end
+                end
+
+                -- set version on request
+                request.api_version = major_version .. rest_version
+                -- return
+                return major_version .. '/' .. dispatcher[method].controller, dispatcher[method].action, params, request
+            end
+        end
+    end
+end
+
+-- call the controller
+function Router.call_controller(request, controller_name, action, params)
+    -- load matched controller and set metatable to new instance of controller
+    local matched_controller = require(controller_name)
+    setmetatable(matched_controller, Controller)
+    local controller_instance = Controller.new(request, params)
+    setmetatable(controller_instance, { __index = matched_controller })
+
+    -- call action
+    local ok, status_or_error, body, headers = pcall(function() return matched_controller[action](controller_instance) end)
+
+    local response
+
+    if ok then
+        -- successful
+        response = Response.new({ status = status_or_error, headers = headers, body = body })
+    else
+        -- controller raised an error
+        local ok, err = pcall(function() return Error.new(status_or_error.code, status_or_error.custom_attrs) end)
+
+        if ok then
+            -- API error,still set 200 status
+            response = Response.new({ status = 200, headers = err.headers, body = err.body })
+        else
+            -- another error, throw
+            ngx.log(ngx.ERR,status_or_error)
+            local code,data = 1, {}
+            local k1,k2 = string.match(status_or_error, "bad mysql result: Duplicate entry '(.+)' for key '(.+)':")
+            if k1 and k2 then
+                code = -1
+                status_or_error = "值已存在"
+                data = {field = k2, value = k1}
+            end
+            -- error(status_or_error)
+            response = Response.new({ status = 200, body = {code = code,msg=status_or_error,data = data}})
+        end
+    end
+
+    return response
+end
+
+function Router.respond(ngx, response)
+    -- set status
+    ngx.status = response.status
+    -- set headers
+    for k, v in pairs(response.headers) do
+        ngx.header[k] = v
+    end
+    -- encode body
+    local json_body = jencode(response.body)
+    -- ensure content-length is set
+    ngx.header["Content-Length"] = ngx.header["Content-Length"] or ngx.header["content-length"] or json_body:len()
+    -- print body
+    ngx.print(json_body)
+end
+
+return Router
